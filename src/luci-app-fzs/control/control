@@ -1,0 +1,15 @@
+Package: luci-app-fzs
+Version: @VERSION@
+Depends: libc, luci-base, uhttpd
+Source: package/luci-app-fzs
+SourceName: luci-app-fzs
+License: GPL-3.0-or-later
+Section: luci
+SourceDateEpoch: 0
+Maintainer: zzt718
+Architecture: all
+Installed-Size: 1
+Description:  蜂助手面板 —— MIBOX-668M2 蜂窝运维 LuCI 应用。
+ 双模组状态面板 / 锁频段(AT*BAND) / 锁频点·锁小区(AT*CELL) /
+ 短信中心(收件箱+转发) / IMEI / APN 与数据开关 / 运维工具。
+ 自包含 AT 引擎，不依赖 mifi-at 内部实现。
