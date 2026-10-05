@@ -1,0 +1,7 @@
+#!/bin/sh
+# luci-app-fzs postinst
+[ -n "${IPKG_INSTROOT}" ] || {
+    rm -rf /tmp/luci-indexcache* 2>/dev/null
+    /etc/init.d/rpcd reload 2>/dev/null
+}
+exit 0
