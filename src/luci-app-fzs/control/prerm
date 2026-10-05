@@ -1,0 +1,8 @@
+#!/bin/sh
+# luci-app-fzs prerm
+[ -n "${IPKG_INSTROOT}" ] || {
+    /etc/init.d/fzs-sms stop 2>/dev/null
+    /etc/init.d/fzs-sms disable 2>/dev/null
+    rm -rf /tmp/luci-indexcache* 2>/dev/null
+}
+exit 0
