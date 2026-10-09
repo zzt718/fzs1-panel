@@ -1,6 +1,6 @@
 Package: luci-app-fzs
 Version: @VERSION@
-Depends: libc, luci-base, uhttpd
+Depends: libc, luci-base, rpcd
 Source: package/luci-app-fzs
 SourceName: luci-app-fzs
 License: GPL-3.0-or-later

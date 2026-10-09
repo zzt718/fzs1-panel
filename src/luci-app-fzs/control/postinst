@@ -1,7 +1,53 @@
 #!/bin/sh
 # luci-app-fzs postinst
 [ -n "${IPKG_INSTROOT}" ] || {
+    # 0.2.4-4 起：轮询间隔默认 2 秒（配新 AT 引擎与解析优化，收信延迟约 1~2 秒）。
+    # 仅在用户仍是历史默认值时迁移（30 / 10 / 3 都是历次默认值，非用户自选）。
+    case "$(uci -q get fzs-sms.globals.interval)" in
+        30|10|3) uci set fzs-sms.globals.interval='2'; uci commit fzs-sms ;;
+    esac
+    # 新选项：入库后是否在 SIM/模组保留副本（0=自动清理，推荐）
+    if [ -z "$(uci -q get fzs-sms.globals.keep_in_storage)" ]; then
+        uci set fzs-sms.globals.keep_in_storage='0'
+        uci commit fzs-sms
+    fi
+    # 新选项：转发哪些模组（1=转，0=不转）。默认都转，保持升级前「全部转发」的行为。
+    if [ -z "$(uci -q get fzs-sms.globals.fwd_modem1)" ]; then
+        uci set fzs-sms.globals.fwd_modem1='1'
+        uci commit fzs-sms
+    fi
+    if [ -z "$(uci -q get fzs-sms.globals.fwd_modem2)" ]; then
+        uci set fzs-sms.globals.fwd_modem2='1'
+        uci commit fzs-sms
+    fi
+    # ★ 2026-10-07 晚 说明：新增的转发渠道配置项（fwd_wecom_webhook 等）**无需**
+    #   在 postinst 里补默认值 —— 因为 uci 把"空值"等同于"删除该项"（实测
+    #   `uci set k=` 与 `uci set k=""` 都不会留下 option），而读取侧
+    #   （fzs-fwd 的 config_get 第三参数、前端的 g()）**本就把缺失当空串**，
+    #   页面照样渲染成空输入框、功能正常。所以这里什么都不用做。
+    #   → 用户填了值才写入；没填就一直是"不存在"，语义一致。
+
+    # ★★ 2026-10-08：清理 opkg 留下的"新版默认配置副本" /etc/config/fzs-sms-opkg
+    #   来历：用户改过 /etc/config/fzs-sms 后，opkg 升级时发现"本地版 ≠ 新版"，
+    #   **保留用户本地版**（正确），同时把新版默认值丢到 `-opkg` 后缀文件里。
+    #   这个文件**不在包清单中**（opkg files 查不到）→ opkg 永远不会自动删它，
+    #   于是**每次升级都新增一个副本、永久堆积**（实测升级一次就留下一个 2.1KB）。
+    #   危害：① 白占用户 overlay（8.7MB 本就紧张）；② **隐私风险** ——
+    #   用户若之后在页面里填了 token，副本可能残留旧值，且用户不知道它的存在。
+    #   处理：升级即删。它对用户没有任何价值（内容 = 包内默认值，包里就有）。
+    rm -f /etc/config/fzs-sms-opkg 2>/dev/null
+
+    /etc/init.d/fzs-sms enable 2>/dev/null
+    /etc/init.d/fzs-sms restart 2>/dev/null
     rm -rf /tmp/luci-indexcache* 2>/dev/null
     /etc/init.d/rpcd reload 2>/dev/null
+
+    # ★ 2026-10-08 决定：**不在这里自动补装 wget-ssl**（曾实现过，已移除）。
+    #   原因：那 4 个渠道（企微/钉钉/飞书/Telegram）属极小众需求，
+    #   而 wget-ssl 依赖链有 2.8MB（libopenssl1.1 占 2.3MB），
+    #   设备 overlay 只有 8.7MB —— **不能让所有用户为少数人的需求付闪存代价**。
+    #   现在的做法：主包零依赖；用户真要用那几个渠道时，页面上会出现一个
+    #   「前往『软件包』安装 wget-ssl」的按钮（见 sms.js 的能力探测提示），
+    #   由用户自己决定装不装。**不替用户做决定、不悄悄装东西。**
 }
 exit 0

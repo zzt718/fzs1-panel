@@ -1,0 +1,183 @@
+#!/bin/sh
+# fzs-smsd —— 短信轮询守护
+#   1) 双卡轮询 → 解码入库（收件箱持久化在 /etc/fzs-sms，重启不丢）
+#   2) 入库后自动从 SIM/模组删除（防存储积满 → 拒收新短信）；可用 uci keep_in_storage=1 关闭
+#   3) 新短信逐条转发（PushPlus / Bark / 通用 webhook），失败重试上限 3 次后转入 fwdq-failed
+#   4) 自适应间隔：用户在短信页时高频（页面每次拉取收件箱会刷新 /tmp/fzs-sms/active），
+#      离开 45 秒后回落到常态间隔 —— 避免长时间占用 AT 口与面板其它操作打架
+mkdir -p /etc/fzs-sms /etc/fzs-sms/fwdq /tmp/fzs-sms
+
+# 首次升级迁移：旧版状态在 /tmp（内存盘），搬一次到持久目录（只搬缺失的）
+for f in inbox.jsonl outbox.jsonl; do
+	[ -f "/tmp/fzs-sms/$f" ] && [ ! -f "/etc/fzs-sms/$f" ] && cp "/tmp/fzs-sms/$f" "/etc/fzs-sms/$f"
+done
+for cfg in modem1 modem2; do
+	for p in seen parts usage; do
+		[ -f "/tmp/fzs-sms/$p-$cfg" ] && [ ! -f "/etc/fzs-sms/$p-$cfg" ] && cp "/tmp/fzs-sms/$p-$cfg" "/etc/fzs-sms/$p-$cfg"
+	done
+done
+
+interval=2
+keep=0
+fwd_enabled=0
+fwd_channels=''
+[ -f /lib/functions.sh ] && . /lib/functions.sh
+if [ -f /etc/config/fzs-sms ]; then
+	config_load fzs-sms
+	config_get interval globals interval 2
+	config_get keep globals keep_in_storage 0
+	config_get fwd_enabled globals fwd_enabled 0
+	config_get fwd_channels globals fwd_channels ''
+fi
+case "$interval" in ''|*[!0-9]*) interval=2 ;; esac
+[ "$interval" -lt 2 ] && interval=2
+# ★ 2026-10-07 晚 22:5x：删除了 FAST / ACTIVE_TTL 两档自适应（详见循环尾部说明）。
+FWDQ=/etc/fzs-sms/fwdq
+FWDFAIL=/etc/fzs-sms/fwdq-failed
+
+# ★ 把 ucode 脚本预编译成字节码：两个模组每轮都要跑一次 ucode，而解释器每次
+#   都要解析 26KB 源码（实测 144ms/次）；用设备自带的 ucc 编译后只要 98ms（省 32% CPU）。
+#   编译失败就退回源码，功能不受影响。
+UC_SMS=/usr/libexec/fzs-sms.uc
+if ucc -c -o /tmp/fzs-sms.uc.bin "$UC_SMS" 2>/dev/null && [ -s /tmp/fzs-sms.uc.bin ]; then
+	UC_SMS=/tmp/fzs-sms.uc.bin
+fi
+
+# 转发执行器 —— 渠道逻辑集中在 /usr/libexec/fzs-fwd（与页面「发送测试」共用同一套代码）
+fwd_do() {   # $1=发件人 $2=时间 $3=正文 → 0=至少一个渠道成功
+	/usr/libexec/fzs-fwd "$1" "$2" "$3"
+}
+
+# 处理转发队列
+fwd_flush() {
+	[ -d "$FWDQ" ] || return 0
+	# 不转发的情形（一律丢弃队列，避免重新开启时把旧短信一股脑发出去）：
+	#   ① 总开关关  ② 没勾任何渠道  ③ 两个模组都不勾（等于不转发）
+	if [ "$fwd_enabled" != "1" ] || [ -z "$fwd_channels" ]; then
+		rm -f "$FWDQ"/* 2>/dev/null
+		return 0
+	fi
+	if [ "$fwd_modem1" != "1" ] && [ "$fwd_modem2" != "1" ]; then
+		rm -f "$FWDQ"/* 2>/dev/null
+		return 0
+	fi
+	_n=0
+	for _f in "$FWDQ"/*; do
+		[ -f "$_f" ] || continue
+		_n=$((_n + 1))
+		[ "$_n" -le 10 ] || break     # 单轮上限，避免队列过长拖慢轮询
+		# ★ 按模组筛选（可只转某个模组）。
+		#   队列文件名格式 = <ts>-<模组号>-<idx>，模组号取自 fzs-sms.uc 写入时的
+		#   `substr(m.modem, 5)`（"modem1" → "1"）。这里取第 2 个字段比对即可，
+		#   **无需改动上层写入逻辑**。
+		#   不转发该模组的消息 → 直接删除（与"未启用转发"同样的处理：不留、不重试）。
+		_fm=$(basename "$_f" | cut -d- -f2)
+		case "$_fm" in
+		1) [ "$fwd_modem1" = "1" ] || { rm -f "$_f" 2>/dev/null; continue; } ;;
+		2) [ "$fwd_modem2" = "1" ] || { rm -f "$_f" 2>/dev/null; continue; } ;;
+		esac
+		_s=$(sed -n '1p' "$_f" 2>/dev/null)
+		_t=$(sed -n '2p' "$_f" 2>/dev/null)
+		_c=$(tail -n +3 "$_f" 2>/dev/null)
+		if fwd_do "$_s" "$_t" "$_c"; then
+			rm -f "$_f"
+		else
+			# 失败计数（文件名后缀 .rN），到 3 次转入 fwdq-failed 不再重试
+			case "$_f" in
+			*.r3)
+				mkdir -p "$FWDFAIL"
+				mv "$_f" "$FWDFAIL/" 2>/dev/null
+				# ★ 上限保护：只留最近 100 条。转发失败的短信会永久堆在这里，
+				#   长期运行必须封顶，否则几年下来是无底洞。
+				if [ "$(ls "$FWDFAIL" 2>/dev/null | wc -l)" -gt 100 ]; then
+					ls -t "$FWDFAIL" 2>/dev/null | tail -n +101 | while read -r _old; do
+						rm -f "$FWDFAIL/$_old"
+					done
+				fi
+				;;
+			*.r2)
+				mv "$_f" "${_f%.r2}.r3" 2>/dev/null
+				;;
+			*.r1)
+				mv "$_f" "${_f%.r1}.r2" 2>/dev/null
+				;;
+			*)
+				mv "$_f" "$_f.r1" 2>/dev/null
+				;;
+			esac
+		fi
+	done
+}
+
+while :; do
+	# ★★ 每轮重读配置（2026-10-07 踩坑后加，0.2.4-12）：
+	#   守护是长驻进程，此前只在「启动时」读一次配置 → 用户改完
+	#   「转发渠道 / 存储位置 / 轮询间隔」**必须重启守护才生效**。
+	#   真实故障：勾了 PushPlus 却收不到转发（内存里还是 fwd_enabled=0）。
+	#   模组开关本来就用 uci -q get 每轮实时读，这里统一成同一风格。
+	#   （只读闪存、不磨损；解析 260 字节配置的开销可忽略。）
+	if [ -f /etc/config/fzs-sms ]; then
+		config_load fzs-sms
+		config_get interval globals interval 2
+		config_get keep globals keep_in_storage 0
+		config_get fwd_enabled globals fwd_enabled 0
+		config_get fwd_channels globals fwd_channels ''
+		# 转发模组选择（2026-10-07 加）。★ 默认值给 "1"（转）而不是 "0"：
+		#   老版本升级上来时配置里没有这两项，若默认 "0" 会让用户
+		#   **突然收不到转发**（正是今晚排查过的那类"改了不生效"事故的反面）。
+		config_get fwd_modem1 globals fwd_modem1 1
+		config_get fwd_modem2 globals fwd_modem2 1
+	fi
+	case "$interval" in ''|*[!0-9]*) interval=2 ;; esac
+	[ "$interval" -lt 2 ] && interval=2
+	# 规范化：非 "1" 一律视为 "0"（防止配置里写进空值/异常值）
+	case "$fwd_modem1" in 1) ;; *) fwd_modem1=0 ;; esac
+	case "$fwd_modem2" in 1) ;; *) fwd_modem2=0 ;; esac
+
+	# 心跳（前端读它判断守护是否活着）
+	# ★ 必须写 tmpfs（/tmp）：它每轮都更新，写到 overlay 闪存等于长期磨盘
+	#   （interval=2 时是每天 4.3 万次写）。重启后 /tmp 清空，页面会短暂显示
+	#   「守护未运行」，第一轮轮询后自愈 —— 这个代价远小于磨闪存。
+	date +%s > /tmp/fzs-sms/lastpoll
+
+	# ① 并行读取两个模组 —— 锁已按模组分开（/tmp/fzs-at-<dev>.lock），互不阻塞，
+	#    单轮耗时从「两模组串行」降到≈单个模组的耗时（实测 4~6s → 2~3s）。
+	# ★ 耗时日志（临时）：记录本轮读取真正花了多久。
+	#   目的：定位"收信 19 秒"是卡在读取（AT 慢/重试）还是卡在别处。
+	for cfg in modem1 modem2; do
+		[ "$(uci -q get fzs-sms.globals.$cfg)" = "0" ] && continue
+		/usr/libexec/fzs-at sms list "$cfg" > "/tmp/fzs-sms/raw-$cfg" 2>/dev/null &
+	done
+	wait
+
+	# ② 串行解析入库 —— inbox.jsonl / seen / parts 是共享状态文件，
+	#    解析必须串行，否则两个模组并发「读-改-写」会互相覆盖丢数据。
+	for cfg in modem1 modem2; do
+		[ "$(uci -q get fzs-sms.globals.$cfg)" = "0" ] && continue
+		if [ -s "/tmp/fzs-sms/raw-$cfg" ] && grep -q '^+CMGL' "/tmp/fzs-sms/raw-$cfg"; then
+			# 与页面「清空收件箱」共用一把文件锁：收件箱/发件箱是共享文件，
+			# 两边都是「读-改-写」，并发会互相覆盖。
+			out=$( ( flock 9; UC_SUB=poll UC_ARG1="$cfg" UC_ARG2="/tmp/fzs-sms/raw-$cfg" ucode "$UC_SMS" 2>/dev/null ) 9>/tmp/fzs-sms-state.lock )
+			# ★ 自动清理：把「本轮真正入库」的条目从 SIM/模组删掉。
+			#   keep_in_storage=1 时保留（用户想让短信留在卡上）。
+			#   分片未拼齐的段不在 del 名单里 → 不会被误删（下轮继续拼）。
+			if [ "$keep" != "1" ] && [ -n "$out" ]; then
+				del=$(printf '%s' "$out" | sed -n 's/.*"del":"\([0-9,]*\)".*/\1/p')
+				if [ -n "$del" ]; then
+					/usr/libexec/fzs-at sms delmulti "$cfg" "$del" >/dev/null 2>&1
+				fi
+			fi
+		fi
+	done
+
+	# ③ 转发
+	fwd_flush
+
+	# 轮询间隔
+	# ★ 2026-10-07 晚 22:5x 简化：原先有「页面活跃时用 FAST、
+	#   离开后回落到 interval」的两档自适应（页面每次拉取会刷新 /tmp/fzs-sms/active）。
+	#   但两档的值都已调成 2 秒，**两档合一 → 参数与整套 active 判定都是多余的**。
+	#   现在只保留一个 interval；页面侧的 active 标志文件已无人使用
+	#   （前端写它的代码后续一并清理，留着也无害）。
+	sleep "$interval"
+done
