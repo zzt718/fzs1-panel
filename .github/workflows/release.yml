@@ -1,0 +1,80 @@
+# ============================================================================
+#  fzs1-panel —— 发 Release（只搬运，不构建）
+#
+#  ★ 为什么不在 CI 里构建：build_ipk.py 用构建时间戳写 tar 的 mtime，
+#    重编一次 md5 就变 —— 那样 Release 里的包就不是真机实测过的那个。
+#    所以 release/ 里放的是本地构建、已上机验证的 ipk，本工作流只把它挂到 Release。
+#
+#  用法：
+#    - 正式发版：python src/push_release.py vX（打 tag → 触发本工作流）
+#    - 手动重跑：Actions 页面 → Release ipk → Run workflow，填 tag
+#
+#  ⚠️ 仓库需在 Settings → Actions → General → Workflow permissions
+#     勾 "Read and write permissions"，否则建不了 Release。
+# ============================================================================
+name: Release ipk
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（形如 v0.2.10，需已推送）'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 解析版本
+        id: v
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: 校验附件（必须已提交进仓库）
+        id: chk
+        run: |
+          IPK="release/luci-app-fzs_${{ steps.v.outputs.ver }}_all.ipk"
+          if [ ! -f "$IPK" ]; then
+            echo "::error::缺少 $IPK —— 先跑 src/push_repo.py 把构建产物提交进 release/"
+            ls -l release/ 2>/dev/null || true
+            exit 1
+          fi
+          md5sum "$IPK" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "ipk=$IPK" >> "$GITHUB_OUTPUT"
+
+      - name: 准备正文
+        run: |
+          if [ ! -f release/notes.md ]; then
+            printf '**luci-app-fzs %s**\n\n详见 [README](https://github.com/zzt718/fzs1-panel#更新日志)。\n' \
+              "${{ steps.v.outputs.ver }}" > release/notes.md
+          fi
+          cat release/notes.md
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.v.outputs.tag }}
+          name: ${{ steps.v.outputs.tag }}
+          body_path: release/notes.md
+          files: ${{ steps.chk.outputs.ipk }}
+          draft: false
+          prerelease: false

@@ -227,6 +227,10 @@ Read / back up / restore / write. A 14-digit input gets its Luhn check digit com
 
 Each modem can have its APN set (auto / carrier presets / custom), plus a per-modem data switch.
 
+"Disable data" **is remembered**: it stays disabled after a reboot, and at boot that modem
+does not dial at all (no "connect first, then disconnect"). It suits SIMs used only for SMS
+forwarding — SMS is still received and forwarded while data is disabled.
+
 ### SMS Centre
 
 - **Dual-modem send & receive** (each modem has its own inbox; shown merged in one UI);
@@ -486,9 +490,25 @@ damages arising from the use of this project.
 
 ## Changelog
 
-> Versions track the public version of `luci-app-fzs` (e.g. `0.2.9`).
+> Versions track the public version of `luci-app-fzs` (e.g. `0.2.10`).
 
-### v0.2.9 (2026-10-13, current)
+### v0.2.10 (2026-11-19, current)
+
+**"Disable data" now remembers your choice: it stays disabled across reboots, with no traffic at boot**
+
+- Background: for users who only forward SMS and never use that SIM for internet, the old
+  "Disable data" only applied to the current run. A reboot turned it back on, and the window
+  before you disabled it again could generate billable traffic;
+- The choice is now saved: **it remains disabled after a reboot**, and at boot that modem
+  **does not dial at all** (it is not "connect first, then disconnect"), so no traffic is generated;
+- "Enable data" is remembered the same way;
+- Only the data path (dial-up / interface / routes) is affected; **modem power, SIM registration and
+  SMS are untouched** — SMS is still received and forwarded while data is disabled (tested);
+- How: the installer injects a small check into the firmware's existing boot script and
+  **does not touch your APN, WiFi name or password settings**; uninstalling the panel restores
+  the original script. After reflashing the firmware, just install the panel again.
+
+### v0.2.9 (2026-10-13)
 
 **New "Wireless": 2.4G transmit power can be raised to the hardware ceiling · page and wording tidy-up**
 

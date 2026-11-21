@@ -112,9 +112,11 @@ return view.extend({
 					return;
 				}
 				var m = c.data || {};
-				var tip = (m.link === 'ppp')
-					? '该模组走 PPP 通路：写入后将发起重新拨号，稍后自动生效。'
-					: '应用过程中该模组会重新激活数据通路，断网约 10~30 秒。';
+				var tip = (m.data === 'off')
+					? '该模组数据已停用：只保存 APN，不会拨号；点「启用数据」后才生效。'
+					: (m.link === 'ppp'
+						? '该模组走 PPP 通路：写入后将发起重新拨号，稍后自动生效。'
+						: '应用过程中该模组会重新激活数据通路，断网约 10~30 秒。');
 				ui.showModal('确认修改 APN', [
 					E('table', { 'class': 'table' }, [
 						E('tr', {}, [ E('th', {}, '目标'), E('td', {}, m.name || name) ]),
@@ -134,6 +136,7 @@ return view.extend({
 									try { d = JSON.parse((r && r.stdout) || ''); } catch (e) {}
 									if (d && d.ok && d.net === 'ok') status.textContent = '✅ 已用 ' + apn + ' 激活并拿到 IP';
 									else if (d && d.ok && d.net === 'wait') status.textContent = '✅ 已写入，重新拨号进行中，稍后自动生效';
+									else if (d && d.ok && d.net === 'off') status.textContent = '✅ APN 已保存；该模组数据处于停用，点「启用数据」后生效';
 									else if (d && d.ok) status.textContent = '⚠️ 已写入，但数据通路未起来，可点「启用数据」重试';
 									else status.textContent = '❌ ' + errMsg(r, d);
 									return refresh();
@@ -153,6 +156,7 @@ return view.extend({
 				if (m.data === 'on') {
 					ui.showModal('确认停用该模组数据', [
 						E('p', {}, '停用后该卡彻底断网（模组数据通路 + 系统接口同时关掉），流量由另一模组接管（若在线）。'),
+						E('p', {}, '停用状态会保存，重启后保持停用，开机不会再自动拨号跑流量。'),
 						E('p', {}, '重新开启后约 40 秒才会重新参与流量分流。'),
 						E('div', { 'class': 'right' }, [
 							E('button', { 'class': 'btn', click: ui.hideModal }, '取消'),
@@ -161,8 +165,11 @@ return view.extend({
 								click: function() {
 									ui.hideModal();
 									status.textContent = '停用中…';
-									fs.exec(FZS_AT, [ 'data', 'off', m.cfg ]).then(function() {
-										status.textContent = '✅ 已停用';
+									fs.exec(FZS_AT, [ 'data', 'off', m.cfg ]).then(function(r) {
+										var d = null;
+										try { d = JSON.parse((r && r.stdout) || ''); } catch (e) {}
+										if (d && d.saved === 0) status.textContent = '✅ 已停用；⚠️ 当前固件不支持保存，重启后会恢复启用';
+										else status.textContent = '✅ 已停用（重启后保持）';
 										return refresh();
 									}).catch(function(e) { status.textContent = failMsg(e); return refresh(); });
 								}

@@ -37,6 +37,10 @@
     #   处理：升级即删。它对用户没有任何价值（内容 = 包内默认值，包里就有）。
     rm -f /etc/config/fzs-sms-opkg 2>/dev/null
 
+    # 数据停用持久化：mifi-modem 是固件脚本，不能打进包（opkg remove 会把平台脚本一起删掉），
+    # 只能装包时注入。锚点不匹配就跳过，不会改坏拨号。
+    /usr/libexec/fzs-platform apply 2>/dev/null
+
     /etc/init.d/fzs-sms enable 2>/dev/null
     /etc/init.d/fzs-sms restart 2>/dev/null
     rm -rf /tmp/luci-indexcache* 2>/dev/null

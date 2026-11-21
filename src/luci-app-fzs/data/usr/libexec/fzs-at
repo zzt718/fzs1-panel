@@ -547,8 +547,12 @@ apn_read_all() {
 	rm -f "$_t.1" "$_t.2"
 }
 
+data_is_off() { [ "$(cat "/etc/mifi/data-$1" 2>/dev/null)" = off ]; }
+
 data_bring_up() {   # $1=cfg，按 link 走固件路径
 	_cfg="$1"
+	# 停用的卡不因改 APN / 退飞行模式被顺手拉起来（重启后也不，见 fzs-platform）
+	data_is_off "$_cfg" && return 0
 	_link=$(apn_cfg_get "$_cfg" link rndis)
 	if [ "$_link" = ppp ]; then
 		ifup "$_cfg" >/dev/null 2>&1
@@ -573,6 +577,11 @@ cmd_apn_write() {   # $1=cfg $2=apn
 	case "$_apn" in ''|*[!a-zA-Z0-9._-]*) die "APN 只能含字母数字和 . _ -" ;; esac
 	uci -q set "mifi.$_cfg.apn=$_apn" || die "写配置失败"
 	uci -q commit mifi || die "提交配置失败"
+	# 停用的卡只存配置、不拉起数据通路（否则等于替用户把流量打开）
+	if data_is_off "$_cfg"; then
+		printf '{"ok":true,"cfg":"%s","apn":"%s","net":"off"}\n' "$_cfg" "$_apn"
+		return 0
+	fi
 	_link=$(apn_cfg_get "$_cfg" link rndis)
 	if [ "$_link" = ppp ]; then
 		ifdown "$_cfg" >/dev/null 2>&1
@@ -601,20 +610,41 @@ cmd_apn_write() {   # $1=cfg $2=apn
 	printf '{"ok":true,"cfg":"%s","apn":"%s","link":"rndis","net":"%s"}\n' "$_cfg" "$_apn" "$_net"
 }
 
+# 数据开关的「停用」必须落盘：只发 QNETDEVCTL + ifdown 的话，开机 mifi-modem
+# 会把 network.modemN.auto 重写成 1 并重新拨号（重启后必然又跑流量）。
+# 标记放独立文件，不写 /etc/config/mifi —— 实测 uci commit 会剥掉那里几十行注释。
+# 开机侧由 fzs-platform 注入的 data_off() 读取（见 docs/数据开关持久化-平台补丁.md）。
+data_mark() {   # $1=cfg $2=on|off
+	mkdir -p /etc/mifi 2>/dev/null
+	printf '%s\n' "$2" > "/etc/mifi/data-$1" 2>/dev/null
+	if [ "$2" = off ]; then
+		uci -q set "network.$1.auto=0"
+	else
+		uci -q set "network.$1.auto=1"
+	fi
+	uci -q commit network
+}
+
+data_saved() {   # 平台补丁在不在：不在的话 auto 会被开机脚本重写回去
+	grep -q 'data_off()' /etc/init.d/mifi-modem 2>/dev/null && echo 1 || echo 0
+}
+
 cmd_data_off() {   # $1=cfg
 	_cfg="$1"
+	data_mark "$_cfg" off
 	_p=$(target_to_port "${_cfg#modem}")
 	[ -n "$_p" ] && at_query "$_p" 'AT+QNETDEVCTL=0,1,0' >/dev/null
 	ifdown "$_cfg" >/dev/null 2>&1
-	printf '{"ok":true,"cfg":"%s","data":"off"}\n' "$_cfg"
+	printf '{"ok":true,"cfg":"%s","data":"off","saved":%s}\n' "$_cfg" "$(data_saved)"
 }
 
 cmd_data_on() {   # $1=cfg
 	_cfg="$1"
+	data_mark "$_cfg" on
 	data_bring_up "$_cfg"
 	_net=fail
 	route_ok "$_cfg" && _net=ok
-	printf '{"ok":true,"cfg":"%s","data":"on","net":"%s"}\n' "$_cfg" "$_net"
+	printf '{"ok":true,"cfg":"%s","data":"on","net":"%s","saved":%s}\n' "$_cfg" "$_net" "$(data_saved)"
 }
 
 # ---- 飞行模式（AT+CFUN，射频全关；硬件已被固件 SIM 自愈验证安全）-----------

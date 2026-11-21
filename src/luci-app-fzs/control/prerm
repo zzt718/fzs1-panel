@@ -1,6 +1,17 @@
 #!/bin/sh
 # luci-app-fzs prerm
 [ -n "${IPKG_INSTROOT}" ] || {
+    # 只有真正卸载才复位；opkg 升级时 $1=upgrade，不能碰用户的停用设置
+    if [ "$1" = "remove" ]; then
+        for _f in /etc/mifi/data-*; do
+            [ -f "$_f" ] || continue
+            printf 'on\n' > "$_f"
+            # auto 也要一起复位，否则卸载后这个模组的接口会一直 down 到下次重启
+            uci -q set "network.${_f##*/data-}.auto=1"
+        done
+        uci -q commit network
+        /usr/libexec/fzs-platform revert 2>/dev/null
+    fi
     /etc/init.d/fzs-sms stop 2>/dev/null
     /etc/init.d/fzs-sms disable 2>/dev/null
     rm -rf /tmp/luci-indexcache* 2>/dev/null

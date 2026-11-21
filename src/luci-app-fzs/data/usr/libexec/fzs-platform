@@ -1,0 +1,110 @@
+#!/bin/sh
+# fzs-platform —— 平台脚本补丁（luci-app-fzs 自带）
+# 用法: fzs-platform apply|status|revert
+#
+# 只做一件事：给 /etc/init.d/mifi-modem 注入「数据停用持久化」逻辑。
+# 为什么不让 mifi-modem 直接进 ipk：opkg remove 会把包内文件一起删掉，
+# 平台拨号脚本消失后模组彻底不上电。只能 postinst 注入 + 自带原件备份。
+# 坑与实测见 docs/数据开关持久化-平台补丁.md
+
+# FZS_MM / FZS_BAK 仅用于本地验证补丁逻辑，设备上不要设置。
+MM=${FZS_MM:-/etc/init.d/mifi-modem}
+BAK=${FZS_BAK:-/etc/fzs-platform-backup}
+
+patched() { grep -q 'data_off()' "$MM" 2>/dev/null; }
+
+status() {
+	[ -f "$MM" ] || { echo "missing"; return 2; }
+	if patched; then echo "patched"; else echo "clean"; fi
+	return 0
+}
+
+apply() {
+	[ -f "$MM" ] || { echo "mifi-modem 不存在，跳过"; return 1; }
+	if patched; then echo "已注入，跳过"; return 0; fi
+
+	# 三个锚点缺一不可。固件换版本时宁可不改，也不能把拨号脚本改坏。
+	for _a in 'uci -q get network.$_m.auto' \
+	          '/usr/libexec/mifi-rndis-activate.sh modem1' \
+	          '/usr/libexec/mifi-rndis-activate.sh modem2'; do
+		if ! grep -Fq "$_a" "$MM"; then
+			echo "固件脚本不含预期锚点（$_a），未改动"
+			logger -t fzs-platform "apply skipped: anchor missing: $_a"
+			return 1
+		fi
+	done
+
+	mkdir -p "$BAK"
+	[ -f "$BAK/mifi-modem.orig" ] || cp "$MM" "$BAK/mifi-modem.orig"
+
+	_t="/tmp/fzs-platform.$$"
+	awk '
+	BEGIN { n1 = 0; n2 = 0; n3 = 0 }
+	/^START=/ && !ins {
+		print "data_off() { [ \"$(cat \"/etc/mifi/data-$1\" 2>/dev/null)\" = off ]; }   # fzs-data-persist"
+		ins = 1
+	}
+	index($0, "uci -q get network.$_m.auto") {
+		print "\t\t_mwa=$_wa"
+		print "\t\tdata_off \"$_m\" && _mwa=0"
+		gsub(/\$_wa/, "$_mwa")
+		print
+		n1++
+		next
+	}
+	index($0, "/usr/libexec/mifi-rndis-activate.sh modem1 ") {
+		sub(/^[\t ]+/, "")
+		print "\t\tif data_off modem1; then"
+		print "\t\t\tlogger -t mifi-modem \"modem1 data=off, 开机跳过 PDP 激活\""
+		print "\t\telse"
+		print "\t\t\t" $0
+		print "\t\tfi"
+		n2++
+		next
+	}
+	index($0, "/usr/libexec/mifi-rndis-activate.sh modem2 ") {
+		sub(/^[\t ]+/, "")
+		print "\t\tif data_off modem2; then"
+		print "\t\t\tlogger -t mifi-modem \"modem2 data=off, 开机跳过 PDP 激活\""
+		print "\t\telse"
+		print "\t\t\t" $0
+		print "\t\tfi"
+		n3++
+		next
+	}
+	{ print }
+	END { if (n1 != 1 || n2 != 1 || n3 != 1) exit 9 }
+	' "$MM" > "$_t"
+
+	if [ $? -ne 0 ]; then
+		rm -f "$_t"
+		echo "锚点计数不符（需要 1/1/1），未改动"
+		return 1
+	fi
+	if ! sh -n "$_t" 2>/dev/null; then
+		rm -f "$_t"
+		echo "补丁后语法检查失败，未改动"
+		return 1
+	fi
+
+	chmod 755 "$_t"
+	mv -f "$_t" "$MM"
+	logger -t fzs-platform "mifi-modem 已注入数据停用持久化"
+	echo "已注入"
+	return 0
+}
+
+revert() {
+	[ -f "$BAK/mifi-modem.orig" ] || { echo "没有原件备份，跳过还原"; return 1; }
+	cp "$BAK/mifi-modem.orig" "$MM" && chmod 755 "$MM"
+	logger -t fzs-platform "mifi-modem 已还原为注入前版本"
+	echo "已还原"
+	return 0
+}
+
+case "$1" in
+apply)  apply ;;
+status) status ;;
+revert) revert ;;
+*)      echo "用法: $0 {apply|status|revert}"; exit 2 ;;
+esac
